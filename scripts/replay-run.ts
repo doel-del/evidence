@@ -80,6 +80,8 @@ import { EvidenceValidator } from '../src/evidence/validators/evidence-validator
 import * as assessmentModule from '../src/evidence/validators/assessment';
 // DuplicateValidator: untuk mode --duplicates.
 import { DuplicateValidator } from '../src/evidence/validators/duplicate';
+import type { SRTSegment } from '../src/evidence/srt';
+import { collectAmbiguous, printAmbiguousReport } from './ambiguous-report';
 import type { DuplicateResult } from '../src/evidence/validators/duplicate';
 import type { EvidenceContext, EvidenceItem } from '../src/evidence/types';
 
@@ -126,6 +128,7 @@ interface BlockingDetail {
 }
 
 interface ItemDecision {
+  subtopic?: string | null;
   key: string;            // "<chunk 1-based>:<posisi 1-based pada hasil parse>"
   chunk: number;
   pos: number;
@@ -162,6 +165,7 @@ interface ChunkReplay {
 interface ReplayResult {
   run: RunRecord;
   chunks: ChunkReplay[];
+  chunkSegments?: Map<number, SRTSegment[]>;
   items: ItemDecision[];
   notes: string[];
   rawSha: string;         // hash seluruh file raw yang dipakai (bukti input identik)
@@ -325,6 +329,7 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
   const notes: string[] = [];
   const chunks: ChunkReplay[] = [];
   const items: ItemDecision[] = [];
+  const chunkSegmentsMap = new Map<number, SRTSegment[]>();
   const rawHash = crypto.createHash('sha256');
 
   // Evidence yang lolos validator, dipakai untuk duplicate gate.
@@ -356,6 +361,7 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
 
   evChunks.forEach((chunk, chunkIndex) => {
     const n = chunkIndex + 1;
+    chunkSegmentsMap.set(n, chunk);
     const rawPath = path.join(RUN_LOG_DIR, run.run_id, `chunk-${n}.raw.txt`);
     if (!fs.existsSync(rawPath)) {
       chunks.push({
@@ -414,6 +420,7 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
         pos,
         accepted: report.accepted,
         type: String(reconciled.type ?? ''),
+        subtopic: reconciled.subtopic ?? null,
         claim: String(ev.claim ?? ''),
         excerpt: String(ev.source_excerpt ?? ''),
         blocking: report.accepted ? [] : Array.from(new Set(blocking)),
@@ -465,6 +472,7 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
 
   return {
     run, chunks, items, notes,
+    chunkSegments: chunkSegmentsMap,
     rawSha: rawHash.digest('hex').slice(0, 12),
     acceptedForDedup: withDuplicates ? acceptedForDedup : undefined,
     duplicates
@@ -1247,6 +1255,14 @@ function main(): void {
 
   if (auditRule) {
     printAuditSamples(results, auditRule, flag('--full'), Number.isFinite(sampleN) ? sampleN : 10);
+  }
+
+  if (flag('--ambiguous-report')) {
+    printAmbiguousReport(
+      collectAmbiguous(results),
+      flag('--full'),
+      Number.isFinite(sampleN) ? sampleN : 10
+    );
   }
 
   const jsonOut = valueOf('--json');
