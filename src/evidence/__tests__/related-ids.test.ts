@@ -636,3 +636,223 @@ test('PASS: referensi duplikat setelah redirect hanya dipertahankan sekali', () 
     expect(result.dropped).toBe(0);
   });
 });
+
+describe('RELATED IDS: redirectRelatedIds — chain, merge, siklus, konflik', () => {
+  const ev = (id: string, refs: string[] | null = null) => ({
+    evidence_id: id,
+    related_evidence_ids: refs
+  });
+
+  test('MERGE 3 anggota: semua anggota di merged_from_ids diarahkan ke hasil merge', () => {
+    const preserved = [
+      ev('E001'),                 // evidence hasil merge (mewarisi ID evidenceA)
+      ev('E004', ['E003']),
+      ev('E005', ['E002'])
+    ];
+
+    const result = redirectRelatedIds(
+      preserved,
+      [],
+      [{
+        evidence_id_a: 'E001',
+        evidence_id_b: 'E002',
+        merged_evidence_id: 'E001',
+        merged_from_ids: ['E001', 'E002', 'E003']
+      }]
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+    expect(result.evidence[2].related_evidence_ids).toEqual(['E001']);
+    expect(result.dropped).toBe(0);
+  });
+
+  test('MERGE 4 anggota: referensi ke dua anggota sekaligus digabung jadi satu', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E009', ['E003', 'E004'])],
+      [],
+      [{
+        evidence_id_a: 'E001',
+        evidence_id_b: 'E002',
+        merged_evidence_id: 'E001',
+        merged_from_ids: ['E001', 'E002', 'E003', 'E004']
+      }]
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+    expect(result.dropped).toBe(1); // duplikat setelah redirect
+  });
+
+  test('kompatibilitas: MERGE tanpa merged_from_ids memakai fallback [a, b]', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E004', ['E002', 'E003'])],
+      [],
+      [{
+        evidence_id_a: 'E002',
+        evidence_id_b: 'E003',
+        merged_evidence_id: 'E001'
+      }]
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+    expect(result.dropped).toBe(1);
+  });
+
+  test('kompatibilitas: tanpa merged_from_ids, anggota ke-3 tidak diredirect (dibuang)', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E005', ['E003'])],
+      [],
+      [{
+        evidence_id_a: 'E001',
+        evidence_id_b: 'E002',
+        merged_evidence_id: 'E001'
+      }]
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toBeNull();
+    expect(result.dropped).toBe(1);
+  });
+
+  test('KEEP chain 7 hop (melewati batas lama 5) berakhir di evidence yang masih ada', () => {
+    const removed = [];
+    for (let i = 2; i <= 8; i++) {
+      removed.push({
+        evidence_id: `E00${i}`,
+        kept_evidence_id: `E00${i - 1}`
+      });
+    }
+
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E009', ['E008'])],
+      removed,
+      []
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+    expect(result.dropped).toBe(0);
+  });
+
+  test('hasil tidak bergantung urutan array removed (chain dibalik)', () => {
+    const removed = [];
+    for (let i = 8; i >= 2; i--) {
+      removed.push({
+        evidence_id: `E00${i}`,
+        kept_evidence_id: `E00${i - 1}`
+      });
+    }
+
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E009', ['E008'])],
+      removed,
+      []
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+  });
+
+  test('KEEP yang kept-nya kemudian dihapus oleh MERGE diselesaikan ke hasil merge', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E009', ['E005'])],
+      [{ evidence_id: 'E005', kept_evidence_id: 'E002' }],
+      [{
+        evidence_id_a: 'E001',
+        evidence_id_b: 'E002',
+        merged_evidence_id: 'E001',
+        merged_from_ids: ['E001', 'E002', 'E003']
+      }]
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+  });
+
+  test('siklus redirect: referensi dibuang dan dicatat di diagnostics.cyclicIds', () => {
+    const result = redirectRelatedIds(
+      [ev('E001', ['E002'])],
+      [
+        { evidence_id: 'E002', kept_evidence_id: 'E003' },
+        { evidence_id: 'E003', kept_evidence_id: 'E002' }
+      ],
+      []
+    );
+
+    expect(result.evidence[0].related_evidence_ids).toBeNull();
+    expect(result.dropped).toBe(1);
+    expect(result.diagnostics.cyclicIds).toContain('E002');
+  });
+
+  test('siklus tidak membuat loop tak hingga dan tidak mengganggu referensi sehat', () => {
+    const result = redirectRelatedIds(
+      [ev('E001', ['E002', 'E010']), ev('E010')],
+      [
+        { evidence_id: 'E002', kept_evidence_id: 'E003' },
+        { evidence_id: 'E003', kept_evidence_id: 'E002' }
+      ],
+      []
+    );
+
+    expect(result.evidence[0].related_evidence_ids).toEqual(['E010']);
+    expect(result.dropped).toBe(1);
+  });
+
+  test('konflik: satu ID dipetakan ke dua tujuan berbeda → dibuang (ambiguous)', () => {
+    const removed = [{ evidence_id: 'E002', kept_evidence_id: 'E001' }];
+    const merged = [{
+      evidence_id_a: 'E002',
+      evidence_id_b: 'E003',
+      merged_evidence_id: 'E004'
+    }];
+    const preserved = [ev('E001'), ev('E004'), ev('E005', ['E002'])];
+
+    const result = redirectRelatedIds(preserved, removed, merged);
+
+    expect(result.evidence[2].related_evidence_ids).toBeNull();
+    expect(result.dropped).toBe(1);
+    expect(result.diagnostics.ambiguousIds).toContain('E002');
+  });
+
+  test('konflik: hasil identik walau urutan removed dibalik (deterministik)', () => {
+    const removedAB = [
+      { evidence_id: 'E002', kept_evidence_id: 'E001' },
+      { evidence_id: 'E002', kept_evidence_id: 'E003' }
+    ];
+    const removedBA = [...removedAB].reverse();
+    const preserved = [ev('E001'), ev('E003'), ev('E005', ['E002'])];
+
+    const a = redirectRelatedIds(preserved, removedAB, []);
+    const b = redirectRelatedIds(preserved, removedBA, []);
+
+    expect(a.evidence[2].related_evidence_ids).toBeNull();
+    expect(b.evidence[2].related_evidence_ids).toBeNull();
+    expect(a.diagnostics.ambiguousIds).toEqual(b.diagnostics.ambiguousIds);
+  });
+
+  test('konflik semu: dua tujuan yang konvergen ke ID akhir sama → TIDAK ambiguous', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E005', ['E002'])],
+      [
+        { evidence_id: 'E002', kept_evidence_id: 'E001' },
+        { evidence_id: 'E002', kept_evidence_id: 'E003' },
+        { evidence_id: 'E003', kept_evidence_id: 'E001' }
+      ],
+      []
+    );
+
+    expect(result.evidence[1].related_evidence_ids).toEqual(['E001']);
+    expect(result.diagnostics.ambiguousIds).toEqual([]);
+  });
+
+  test('ID yang masih ada tidak pernah di-redirect (alive wins)', () => {
+    const result = redirectRelatedIds(
+      [ev('E001'), ev('E002'), ev('E005', ['E002'])],
+      [{ evidence_id: 'E002', kept_evidence_id: 'E001' }],
+      []
+    );
+
+    expect(result.evidence[2].related_evidence_ids).toEqual(['E002']);
+  });
+
+  test('diagnostics kosong pada kasus normal', () => {
+    const result = redirectRelatedIds([ev('E001', ['E001'])], [], []);
+
+    expect(result.diagnostics).toEqual({ ambiguousIds: [], cyclicIds: [] });
+  });
+});
