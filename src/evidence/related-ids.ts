@@ -42,7 +42,7 @@ export interface ChunkKeyDiagnostics {
   chunkIndex: number;
   mode: 'llm-ids' | 'position';
   /** Alasan mode: 'ok' bila evidence_id LLM lengkap dan unik. */
-  reason: 'ok' | 'missing-ids' | 'duplicate-ids' | 'empty-chunk';
+  reason: 'ok' | 'missing-ids' | 'duplicate-ids' | 'empty-chunk' | 'auto-fill-collision';
   /** Rentang nomor lokal terkecil..terbesar (untuk melihat basis penomoran LLM). */
   idRange: [string, string] | null;
   totalParsed: number;
@@ -50,12 +50,24 @@ export interface ChunkKeyDiagnostics {
   duplicateIds: string[];
   /** Semua nomor lokal (dari SEMUA item parse, termasuk yang dibuang). */
   allLocalIds: string[];
+  /** BARU: jumlah item yang evidence_id-nya di-auto-fill parser */
+  autoFilledCount: number;
+  /** BARU: jumlah item dengan source='model' (tidak di-auto-fill) */
+  modelProvidedCount: number;
+  /** ID yang ambiguous (duplikat atau collision) — referensi ke ID ini akan di-drop */
+  ambiguousIds: string[];
+  /**
+   * Posisi 1-based yang ID model-nya tidak sesuai urutan array.
+   * Observability only — ID tetap dipakai untuk pemetaan.
+   * Hanya berisi posisi dengan source='model' dan ID unik.
+   */
+  outOfOrderPositions: number[];
 }
 
 export interface DroppedRef {
   from: string;          // evidence_id final item sumber
   ref: string;           // nilai mentah dari LLM
-  reason: 'target-removed' | 'target-nonexistent' | 'target-unclassified' | 'unparseable';
+  reason: 'target-removed' | 'target-nonexistent' | 'target-unclassified' | 'unparseable' | 'ambiguous';
 }
 
 export interface ChunkRemapStats {
@@ -65,13 +77,15 @@ export interface ChunkRemapStats {
   itemsAccepted: number;
   emitted: number;
   mapped: number;
-  droppedTargetRemoved: number;     // menunjuk item yang di-quarantine/dibuang
-  droppedTargetNonexistent: number; // nomor tidak ada di chunk sama sekali
-  droppedTargetUnclassified: number; // diagnostik chunk tidak tersedia, jadi tak bisa dibedakan
+  droppedTargetRemoved: number;
+  droppedTargetNonexistent: number;
+  droppedTargetUnclassified: number;
   droppedUnparseable: number;
   droppedSelf: number;
   droppedDuplicate: number;
-  samples: DroppedRef[];            // maks 8 contoh per chunk
+  /** BARU: referensi ke ID yang collision (auto-fill + model) — tidak bisa dipetakan dengan aman */
+  droppedAmbiguous: number;
+  samples: DroppedRef[];
 }
 
 interface HasRelated {
@@ -85,6 +99,7 @@ export interface RemapStats {
   droppedUnknown: number; // menunjuk item terbuang / tak dikenal
   droppedSelf: number;
   droppedDuplicate: number;
+  droppedAmbiguous: number;
   chunksUsingLlmIds: number;
   chunksUsingPosition: number;
   perChunk: ChunkRemapStats[];
@@ -125,7 +140,8 @@ function posToLocal(position: number): string {
  */
 export function buildChunkLocalKeys(
   chunkEvidence: Array<{ evidence_id?: unknown }>,
-  chunkIndex: number
+  chunkIndex: number,
+  idMetadata?: import('./production-pipeline').EvidenceIdMetadata[]
 ): { keys: LocalKey[]; mode: 'llm-ids' | 'position'; diagnostics: ChunkKeyDiagnostics } {
   const llmIds = chunkEvidence.map(e => normalizeLocalId(e?.evidence_id));
   const missingIds = llmIds.filter(id => id === null).length;
@@ -133,10 +149,100 @@ export function buildChunkLocalKeys(
   for (const id of llmIds) if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
   const duplicateIds = [...counts.entries()].filter(([, c]) => c > 1).map(([id]) => id);
 
+  // BARU: Deteksi collision antara ID auto-fill dan ID model.
+  // Skenario: parser auto-fill E001 di posisi 1; model menulis E001 di posisi 2.
+  // Keduanya normalizeLocalId → "E001", tapi berasal dari sumber berbeda.
+  // Referensi model ke "E001" tidak bisa dipetakan dengan aman → ambiguous.
+  let hasAutoFillCollision = false;
+  let ambiguousIds: string[] = [];
+  let autoFilledCount = 0;
+  let modelProvidedCount = 0;
+  if (idMetadata && idMetadata.length === chunkEvidence.length) {
+    const bySource = new Map<string, Set<'model' | 'auto-fill'>>();
+    for (let i = 0; i < idMetadata.length; i++) {
+      const meta = idMetadata[i];
+
+      // Item invalid (bukan objek) tidak punya ID dan tidak bisa
+      // di-auto-fill. Skip eksplisit — bukan bagian dari
+      // autoFilledCount maupun modelProvidedCount.
+      if (meta.source === 'invalid') continue;
+
+      // Setelah filter di atas, TS men-narrow `meta.source` menjadi
+      // 'model' | 'auto-fill'. Logic di bawah aman dari kedua sisi
+      // (tipe maupun runtime).
+      const finalId =
+        meta.source === 'auto-fill'
+          ? posToLocal(meta.position)
+          : (meta.originalId ? normalizeLocalId(meta.originalId) : null);
+      if (!finalId) continue;
+
+      if (!bySource.has(finalId)) bySource.set(finalId, new Set());
+      bySource.get(finalId)!.add(meta.source);
+
+      if (meta.source === 'auto-fill') autoFilledCount++;
+      else modelProvidedCount++;
+    }
+    for (const [id, sources] of bySource.entries()) {
+      if (sources.has('model') && sources.has('auto-fill')) {
+        ambiguousIds.push(id);
+        hasAutoFillCollision = true;
+      }
+    }
+  }
+
+  // Semua ID duplikat bersifat ambiguous, terlepas dari sumbernya:
+  // - model + model (model menulis ID sama dua kali)
+  // - model + auto-fill (collision)
+  // - auto-fill + auto-fill (tidak mungkin karena posisi unik)
+  //
+  // Referensi ke ID duplikat tidak bisa dipetakan dengan aman karena
+  // model mungkin maksudkan posisi yang berbeda dari yang di-resolve
+  // oleh map. Ini selaras dengan keputusan C (preserve + diagnose).
+  ambiguousIds = [...new Set([...ambiguousIds, ...duplicateIds])].sort();
+
+    // Diagnosis ID model yang tidak sesuai urutan array.
+  // Tidak mengubah mapping — hanya observability.
+  // ID unik yang out-of-order tetap dipakai; hanya posisi yang dicatat.
+  const outOfOrderPositions: number[] = [];
+
+  const hasAlignedMetadata =
+    idMetadata !== undefined &&
+    idMetadata.length === chunkEvidence.length;
+
+  for (let i = 0; i < chunkEvidence.length; i++) {
+    // Jika metadata tersedia, hanya ID dari model yang diperiksa.
+    // Jika metadata tidak diberikan (API lama), ID yang tersedia
+    // dianggap berasal dari model.
+    if (hasAlignedMetadata && idMetadata[i].source !== 'model') {
+      continue;
+    }
+
+    const actualId = hasAlignedMetadata
+      ? normalizeLocalId(idMetadata[i].originalId)
+      : llmIds[i];
+
+    const expectedId = posToLocal(i + 1);
+
+    if (
+      actualId &&
+      actualId !== expectedId &&
+      !duplicateIds.includes(actualId)
+    ) {
+      outOfOrderPositions.push(i + 1);
+    }
+  }
+
   let reason: ChunkKeyDiagnostics['reason'] = 'ok';
-  if (llmIds.length === 0) reason = 'empty-chunk';
-  else if (missingIds > 0) reason = 'missing-ids';
-  else if (duplicateIds.length > 0) reason = 'duplicate-ids';
+
+  if (llmIds.length === 0) {
+    reason = 'empty-chunk';
+  } else if (hasAutoFillCollision) {
+    reason = 'auto-fill-collision';
+  } else if (duplicateIds.length > 0) {
+    reason = 'duplicate-ids';
+  } else if (missingIds > 0) {
+    reason = 'missing-ids';
+  }
   const mode: 'llm-ids' | 'position' = reason === 'ok' ? 'llm-ids' : 'position';
 
   const keys: LocalKey[] = chunkEvidence.map((_, i) => ({
@@ -151,7 +257,20 @@ export function buildChunkLocalKeys(
   return {
     keys,
     mode,
-    diagnostics: { chunkIndex, mode, reason, idRange, totalParsed: llmIds.length, missingIds, duplicateIds, allLocalIds }
+    diagnostics: {
+      chunkIndex,
+      mode,
+      reason,
+      idRange,
+      totalParsed: llmIds.length,
+      missingIds,
+      duplicateIds,
+      allLocalIds,
+      autoFilledCount,
+      modelProvidedCount,
+      ambiguousIds,
+      outOfOrderPositions
+    }
   };
 }
 
@@ -204,7 +323,7 @@ export function remapRelatedIds<T extends HasRelated>(
     let c = perChunkMap.get(ci);
     if (!c) {
       const d = diagByChunk.get(ci);
-      c = {
+            c = {
         chunkIndex: ci,
         mode: modeByChunk.get(ci) ?? d?.mode ?? 'position',
         reason: d?.reason ?? 'unknown',
@@ -217,6 +336,7 @@ export function remapRelatedIds<T extends HasRelated>(
         droppedUnparseable: 0,
         droppedSelf: 0,
         droppedDuplicate: 0,
+        droppedAmbiguous: 0,
         samples: []
       };
       perChunkMap.set(ci, c);
@@ -224,16 +344,16 @@ export function remapRelatedIds<T extends HasRelated>(
     return c;
   };
 
-  const stats: RemapStats = {
+    const stats: RemapStats = {
     totalRefs: 0,
     mapped: 0,
     droppedUnknown: 0,
     droppedSelf: 0,
     droppedDuplicate: 0,
+    droppedAmbiguous: 0,
     chunksUsingLlmIds: [...modeByChunk.values()].filter(m => m === 'llm-ids').length,
     chunksUsingPosition: [...modeByChunk.values()].filter(m => m === 'position').length,
     perChunk: [],
-    // BARU: tracking per-evidence (observability, tidak mengubah perilaku).
     evidenceWithRawRefs: new Set<string>(),
     evidenceWithMappedRefs: new Set<string>()
   };
@@ -270,14 +390,25 @@ export function remapRelatedIds<T extends HasRelated>(
       cs.emitted++;
       const local = normalizeLocalId(r);
 
-      // ── Self-reference check DULU, sebelum resolusi ─────────
+      // ── Ambiguous check DULU ─────────────────────────────────
+      // Jika local ID ambigu (duplikat, collision auto-fill+model, atau
+      // model+model), kita tidak bisa yakin ID mana yang dimaksud model.
+      // Cek ini SEBELUM self-reference agar diagnosis akurat: reference
+      // ke ID ambigu harus di-drop sebagai 'ambiguous' meskipun kebetulan
+      // sama dengan ID lokal sumber.
+      const diag = diagByChunk.get(keys[i].chunkIndex);
+      if (local && diag?.ambiguousIds?.includes(local)) {
+        stats.droppedAmbiguous++;
+        cs.droppedAmbiguous++;
+        note(String(r), 'ambiguous');
+        continue;
+      }
+
+      // ── Self-reference check ────────────────────────────────
       // Dua jalur deteksi:
-      //   (a) local === keys[i].localId  → LLM menulis local ID sendiri
-      //   (b) local === myLocalIdFromFinal → LLM menulis final ID sendiri
+      //   (a) local === keys[i].localId  → model menulis local ID sendiri
+      //   (b) local === myLocalIdFromFinal → model menulis final ID sendiri
       //                                      (mis. "Bmgp2VZufRY-E111")
-      // Kalau finalId undefined (target di-quarantine, atau tidak ada
-      // di map), pengecekan di bawah TIDAK akan jalan. Karena itu cek
-      // self harus dilakukan di sini.
       if (
         local &&
         (local === myLocalIdFromKey || local === myLocalIdFromFinal)
