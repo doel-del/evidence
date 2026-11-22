@@ -1409,10 +1409,17 @@ export function resolveDuplicateActions(
     // mengisi keptId untuk KEEP_BEST/KEEP_FIRST, ini akan error keras
     // alih-alih diam-diam salah pilih A.
     if (resolution.action === 'KEEP_BEST' || resolution.action === 'KEEP_FIRST') {
-      if (!resolution.keptId) {
+      if (
+        !resolution.keptId ||
+        (
+          resolution.keptId !== resolution.evidence_id_a &&
+          resolution.keptId !== resolution.evidence_id_b
+        )
+      ) {
         console.warn(
-          `⚠️ Resolution ${resolution.action} tanpa keptId untuk ` +
-          `${resolution.evidence_id_a}/${resolution.evidence_id_b}, dilewati (PRESERVE fallback).`
+          `⚠️ Resolution ${resolution.action} dengan keptId tidak valid untuk ` +
+          `${resolution.evidence_id_a}/${resolution.evidence_id_b}: ` +
+          `${resolution.keptId ?? '-'}, dilewati (PRESERVE fallback).`
         );
         continue;
       }
