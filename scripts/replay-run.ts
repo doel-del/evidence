@@ -95,6 +95,9 @@ interface ChunkRecord {
   chunk: number;
   status: string;
   raw_chars: number | null;
+  // Dicatat server.ts sejak run log. Opsional: run lama bisa tidak punya.
+  segments?: [number, number];
+  chars?: number;
   parsed: number;
   accepted: number;
   quarantine: number;
@@ -115,6 +118,9 @@ interface RunRecord {
 }
 
 type Outcome = 'diterima' | 'diterima+flag' | 'karantina';
+
+// Hasil verifikasi rekonstruksi chunk terhadap record run asli.
+type ContextStatus = 'OK' | 'LEGACY_FORMAT' | 'BOUNDARY_DIFF' | 'CHARS_DIFF' | 'UNKNOWN';
 
 // BARU: klasifikasi jenis kegagalan GROUNDING/PROVENANCE.
 // Membedakan: melintasi SRT vs elipsis vs tidak ditemukan vs ambigu.
@@ -160,6 +166,9 @@ interface ChunkReplay {
   strategy: string;
   note?: string;
   diagnosis?: string[];
+  // Verifikasi rekonstruksi chunk terhadap run asli.
+  ctx?: ContextStatus;
+  ctxDetail?: string;
 }
 
 interface ReplayResult {
@@ -169,6 +178,11 @@ interface ReplayResult {
   items: ItemDecision[];
   notes: string[];
   rawSha: string;         // hash seluruh file raw yang dipakai (bukti input identik)
+  // true bila isi file SRT cocok dengan run.srt_sha; false bila tidak;
+  // undefined bila SRT tidak ditemukan.
+  srtVerified?: boolean;
+  // Hash ISI file SRT yang dibaca replay ini (bukan srt_sha tercatat).
+  srtContentSha?: string;
   // Hanya diisi jika withDuplicates=true:
   acceptedForDedup?: EvidenceItem[];  // evidence dengan ID sintetis "c<chunk>:<pos>"
   duplicates?: DuplicateResult;
@@ -179,7 +193,35 @@ interface SavedRun {
   code_hash?: string;
   rules_version?: string;
   raw_sha?: string;
+  // Fingerprint konteks rekonstruksi. Opsional: simpanan lama tidak punya.
+  // chunk_* bernilai null bila run asli tidak mencatatnya.
+  srt_sha?: string;
+  // Hash ISI file SRT saat snapshot dibuat. Opsional: simpanan sebelum
+  // Patch 1c tidak punya.
+  srt_content_sha?: string | null;
+  chunk_chars?: number | null;
+  chunk_overlap?: number | null;
   items: ItemDecision[];
+}
+
+// Sinkron dengan maxSpan di provenance.ts / grounding.ts (Opsi A). Hanya
+// untuk teks diagnostik; bukan sumber kebenaran.
+const PROVENANCE_MAX_SPAN = 5;
+
+// Aturan --audit yang TIDAK dievaluasi replay: replayRun hanya menjalankan
+// EvidenceValidator.validate (5 aturan per-evidence). TimestampValidator dan
+// RelationValidator berjalan pasca-duplicate-gate di server.ts. Hasil "0
+// karantina" untuk keduanya akan salah dibaca sebagai "lolos".
+const AUDIT_NOT_EVALUATED = ['TIMESTAMP', 'RELATION'];
+
+const REPLAY_SCOPE_NOTE =
+  'LINGKUP REPLAY: parse + filter struktural + reconcile + 5 validator per-evidence. ' +
+  'TIDAK mencakup duplicate resolution, remap related_evidence_ids, TIMESTAMP, RELATION. ' +
+  '"accepted" di sini BUKAN jumlah evidence final produksi.';
+
+// Sama dengan shortHash di server.ts (sha256 hex, 8 karakter pertama).
+function shortHash(input: string | Buffer): string {
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 8);
 }
 
 function outcomeOf(i: { accepted: boolean; flags?: string[] }): Outcome {
@@ -325,6 +367,38 @@ function diagnoseParseFailure(rawOutput: string): string[] {
 // ------------------------------------------------------------
 // Replay satu run
 // ------------------------------------------------------------
+// Bandingkan chunk hasil rekonstruksi dengan record chunk run asli.
+// BOUNDARY_DIFF diprioritaskan di atas CHARS_DIFF.
+function verifyChunkContext(
+  orig: ChunkRecord | undefined,
+  chunk: SRTSegment[]
+): { status: ContextStatus; detail: string } {
+  if (!orig) {
+    return { status: 'UNKNOWN', detail: 'record chunk run asli tidak ada' };
+  }
+  if (!orig.segments || orig.chars === undefined) {
+    return { status: 'UNKNOWN', detail: 'segments/chars tidak tercatat di run asli' };
+  }
+
+  const first = chunk[0]?.index;
+  const last = chunk[chunk.length - 1]?.index;
+  const chars = buildChunkText(chunk).length;
+
+  if (orig.segments[0] !== first || orig.segments[1] !== last) {
+    return {
+      status: 'BOUNDARY_DIFF',
+      detail: `segmen asli ${orig.segments[0]}..${orig.segments[1]} vs rekonstruksi ${first}..${last}`
+    };
+  }
+  if (orig.chars !== chars) {
+    return {
+      status: 'CHARS_DIFF',
+      detail: `chars asli ${orig.chars} vs rekonstruksi ${chars} (selisih ${chars - orig.chars})`
+    };
+  }
+  return { status: 'OK', detail: '' };
+}
+
 function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResult {
   const notes: string[] = [];
   const chunks: ChunkReplay[] = [];
@@ -344,7 +418,15 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
     return { run, chunks, items, notes, rawSha: '-' };
   }
 
-  const segments = parseSRT(fs.readFileSync(srtPath, 'utf8'));
+  const srtText = fs.readFileSync(srtPath, 'utf8');
+  const srtVerified = shortHash(srtText) === run.srt_sha;
+  if (!srtVerified) {
+    notes.push(
+      `Isi file SRT (${shortHash(srtText)}) TIDAK cocok dengan srt_sha tercatat ` +
+      `(${run.srt_sha}); file diubah manual? Konteks validasi tidak terjamin.`
+    );
+  }
+  const segments = parseSRT(srtText);
   const evChunks = buildEvidenceChunks(
     segments,
     run.chunk_chars ?? 18000,
@@ -362,11 +444,13 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
   evChunks.forEach((chunk, chunkIndex) => {
     const n = chunkIndex + 1;
     chunkSegmentsMap.set(n, chunk);
+    const ctxCheck = verifyChunkContext(run.chunks.find(c => c.chunk === n), chunk);
     const rawPath = path.join(RUN_LOG_DIR, run.run_id, `chunk-${n}.raw.txt`);
     if (!fs.existsSync(rawPath)) {
       chunks.push({
         chunk: n, parsed: 0, structurallyInvalid: 0, accepted: 0, flagged: 0, quarantine: 0,
-        parseStatus: '-', strategy: '-', note: 'raw tidak ada (chunk gagal di run asli?)'
+        parseStatus: '-', strategy: '-', note: 'raw tidak ada (chunk gagal di run asli?)',
+        ctx: ctxCheck.status, ctxDetail: ctxCheck.detail
       });
       return;
     }
@@ -453,7 +537,9 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
       note: (parsedResult as any).salvage
         ? `diselamatkan ${(parsedResult as any).salvage.recovered} item (diperbaiki ${(parsedResult as any).salvage.repaired}, dilewati ${(parsedResult as any).salvage.skipped}${(parsedResult as any).salvage.truncated ? ', terpotong' : ''})`
         : undefined,
-      diagnosis: parsedResult.status === 'FAILED' ? diagnoseParseFailure(rawText) : undefined
+      diagnosis: parsedResult.status === 'FAILED' ? diagnoseParseFailure(rawText) : undefined,
+      ctx: ctxCheck.status,
+      ctxDetail: ctxCheck.detail
     });
   });
 
@@ -474,6 +560,8 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
     run, chunks, items, notes,
     chunkSegments: chunkSegmentsMap,
     rawSha: rawHash.digest('hex').slice(0, 12),
+    srtVerified,
+    srtContentSha: shortHash(srtText),
     acceptedForDedup: withDuplicates ? acceptedForDedup : undefined,
     duplicates
   };
@@ -677,7 +765,7 @@ function printFailureSamples(
       if (kind === 'MULTI_SRT' && it.sourceCoordinates && it.chunkText) {
         const sc = it.sourceCoordinates;
         const span = (sc.segment_end_index ?? 0) - (sc.segment_start_index ?? 0) + 1;
-        console.log(`  span    : ${span} segmen SRT (batas maxSpan=3)`);
+        console.log(`  span    : ${span} segmen SRT (batas maxSpan=${PROVENANCE_MAX_SPAN})`);
       }
     }
     if (!full && matched.length > shown.length) {
@@ -902,6 +990,7 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
     `${run.code_hash && run.code_hash !== currentHash ? '  (KODE SUDAH BERUBAH)' : ''}`
   );
   console.log(`  aturan assessment sekarang=${RULES_VERSION}  raw_sha=${res.rawSha}`);
+  console.log(`  ${REPLAY_SCOPE_NOTE}`);
   for (const n of notes) console.log(`  ! ${n}`);
 
   console.log(`  ${pad('chunk', 6)}${pad('parsed', 8)}${pad('accept', 8)}${pad('quar', 6)}${pad('parse', 22)}| asli: parsed/accept/quar -> parity`);
@@ -915,6 +1004,7 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
       `  ${pad(c.chunk, 6)}${pad(c.parsed, 8)}${pad(c.accepted, 8)}${pad(c.quarantine, 6)}` +
       `${pad(`${c.parseStatus}/${c.strategy}`, 22)}| ` +
       `${orig ? `${orig.parsed}/${orig.accepted}/${orig.quarantine}` : '-'} -> ${same ? 'SAMA' : 'BEDA'}` +
+      `  ctx=${c.ctx ?? '-'}` +
       `${c.note ? '  ' + c.note : ''}`
     );
   }
@@ -922,6 +1012,11 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
     if (!c.diagnosis) continue;
     console.log(`  >> chunk ${c.chunk}: PARSE GAGAL, diagnosis:`);
     for (const d of c.diagnosis) console.log(`       ${d}`);
+  }
+  for (const c of chunks) {
+    if (c.ctx && c.ctx !== 'OK') {
+      console.log(`  ~ chunk ${c.chunk}: konteks ${c.ctx}${c.ctxDetail ? ' — ' + c.ctxDetail : ''}`);
+    }
   }
   const rate = tp > 0 ? ((tq / tp) * 100).toFixed(1) : '0.0';
   console.log(
@@ -942,7 +1037,7 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
 
   const quar = items.filter(i => !i.accepted);
   const shown = full ? quar : quar.slice(0, 40);
-  for (const q of shown) {
+    for (const q of shown) {
     console.log(`  [c${q.chunk}#${q.pos}] ${q.blocking.join('+') || '-'} | ${q.type} | sub=${q.subtopic ?? 'null'} | ${trunc(q.claim, 70)}`);
     console.log(`        EXCERPT: ${trunc(q.excerpt, 110)}`);
     console.log(`        ${trunc(q.reason, 150)}`);
@@ -964,6 +1059,7 @@ function printRun(res: ReplayResult, full: boolean, currentHash: string): void {
 function printAllTable(results: ReplayResult[]): void {
   console.log('='.repeat(78));
   console.log(`RINGKASAN SEMUA RUN (hasil replay dengan kode SAAT INI, aturan assessment=${RULES_VERSION})`);
+  console.log(REPLAY_SCOPE_NOTE);
   console.log(`${pad('run', 21)}${pad('review', 13)}${pad('parsed', 8)}${pad('accept', 8)}${pad('flag', 6)}${pad('quar', 6)}${pad('rasio', 8)}${pad('gagal-parse', 12)}aturan`);
   const totalRules: Record<string, number> = {};
   const totalFlags: Record<string, number> = {};
@@ -995,6 +1091,42 @@ function printAllTable(results: ReplayResult[]): void {
       `${pad(tp, 8)}${pad(ta, 8)}${pad(tf, 6)}${pad(tq, 6)}${pad(tp ? ((tq / tp) * 100).toFixed(1) + '%' : '-', 8)}` +
       `${pad(r.chunks.filter(c => c.parseStatus === 'FAILED').length + '/' + r.chunks.length, 12)}${fmtRules(rules)}`
     );
+  }
+  const srtMismatch = results.filter(r => r.srtVerified === false);
+  if (srtMismatch.length > 0) {
+    console.log(
+      `PERINGATAN: ${srtMismatch.length} run isi SRT-nya TIDAK cocok srt_sha tercatat. ` +
+      `Terdampak: GROUNDING, PROVENANCE, koordinat. ` +
+      `Tidak terdampak (tidak membaca SRT): ASSESSMENT, ATOMICITY, VALUE.`
+    );
+    for (const r of srtMismatch) {
+      console.log(`  - ${r.run.run_id} (srt_sha ${r.run.srt_sha})`);
+    }
+  }
+  const ctxBad = results.filter(r =>
+    r.chunks.some(c => c.ctx === 'BOUNDARY_DIFF' || c.ctx === 'CHARS_DIFF'));
+  if (ctxBad.length > 0) {
+    console.log(
+      `PERINGATAN: ${ctxBad.length} run punya chunk yang rekonstruksinya tidak cocok dengan run asli. ` +
+      `BOUNDARY_DIFF = batas segmen beda (pasangan raw-konteks tidak terjamin); ` +
+      `CHARS_DIFF = panjang teks beda (SRT diedit ATAU format teks chunk berubah).`
+    );
+    for (const r of ctxBad) {
+      const b = r.chunks.filter(c => c.ctx === 'BOUNDARY_DIFF').length;
+      const d = r.chunks.filter(c => c.ctx === 'CHARS_DIFF').length;
+      console.log(`  - ${r.run.run_id}  BOUNDARY_DIFF=${b}  CHARS_DIFF=${d}  (dari ${r.chunks.length} chunk)`);
+    }
+  }
+  const ctxLegacy = results.filter(r => r.chunks.some(c => c.ctx === 'LEGACY_FORMAT')).length;
+  if (ctxLegacy > 0) {
+    console.log(
+      `Catatan: ${ctxLegacy} run memakai format teks chunk lama (tanpa penanda [N]); ` +
+      `batas segmen cocok, panjang cocok dengan format lama (kemungkinan bukan edit SRT).`
+    );
+  }
+  const ctxUnknown = results.filter(r => r.chunks.some(c => c.ctx === 'UNKNOWN')).length;
+  if (ctxUnknown > 0) {
+    console.log(`Catatan: ${ctxUnknown} run punya chunk dengan verifikasi konteks UNKNOWN (segments/chars tidak tercatat).`);
   }
   console.log(`Total karantina per aturan: ${fmtRules(totalRules)}`);
   console.log(`Total diterima dengan flag per aturan: ${fmtRules(totalFlags)}`);
@@ -1084,6 +1216,7 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
   const tally = { before: { diterima: 0, 'diterima+flag': 0, karantina: 0 }, after: { diterima: 0, 'diterima+flag': 0, karantina: 0 } };
   const flips: string[] = [];
   let compared = 0, inputSame = 0, inputDiff = 0, inputUnknown = 0, missingRuns = 0;
+  let configDiff = 0, configUnknown = 0, srtFidelityWarn = 0;
   const beforeVersions = new Set<string>();
   const beforeHashes = new Set<string>();
 
@@ -1103,6 +1236,53 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
     } else {
       inputUnknown++;
     }
+
+    // Fingerprint SRT + konfigurasi chunk (konteks rekonstruksi).
+    let runConfigDiff = false;
+    let runConfigUnknown = false;
+
+    // (a) Fidelitas terhadap run ASLI: informasional.
+    if (res.srtVerified === false) {
+      srtFidelityWarn++;
+      console.log(
+        `  ~ ${res.run.run_id}: isi SRT di disk berbeda dari SRT run ASLI ` +
+        `(fidelitas GROUNDING/PROVENANCE terhadap run asli tidak terjamin)`
+      );
+      // Tanpa srt_content_sha di snapshot, tidak bisa dibuktikan bahwa file
+      // belum berubah sejak snapshot.
+      if (prev.srt_content_sha == null) runConfigUnknown = true;
+    }
+
+    // (b) Snapshot vs sekarang: ini yang memutus apple-to-apple.
+    if (prev.srt_content_sha != null && prev.srt_content_sha !== res.srtContentSha) {
+      runConfigDiff = true;
+      console.log(
+        `  ! ${res.run.run_id}: isi file SRT BERUBAH sejak snapshot ` +
+        `(${prev.srt_content_sha} -> ${res.srtContentSha ?? '-'}) — bukan apple-to-apple`
+      );
+    }
+
+    if (prev.srt_sha === undefined) {
+      runConfigUnknown = true;
+    } else {
+      const diffs: string[] = [];
+      if (prev.srt_sha !== res.run.srt_sha) {
+        diffs.push(`srt_sha ${prev.srt_sha} vs ${res.run.srt_sha}`);
+      }
+      if ((prev.chunk_chars ?? null) !== (res.run.chunk_chars ?? null)) {
+        diffs.push(`chunk_chars ${prev.chunk_chars ?? '-'} vs ${res.run.chunk_chars ?? '-'}`);
+      }
+      if ((prev.chunk_overlap ?? null) !== (res.run.chunk_overlap ?? null)) {
+        diffs.push(`chunk_overlap ${prev.chunk_overlap ?? '-'} vs ${res.run.chunk_overlap ?? '-'}`);
+      }
+      if (diffs.length > 0) {
+        runConfigDiff = true;
+        console.log(`  ! ${res.run.run_id}: konfigurasi rekonstruksi BEDA (${diffs.join('; ')}) — bukan apple-to-apple`);
+      }
+    }
+
+    if (runConfigDiff) configDiff++;
+    if (runConfigUnknown) configUnknown++;
 
     const before = new Map(prev.items.map(i => [i.key, i]));
     const after = new Map(res.items.map(i => [i.key, i]));
@@ -1135,12 +1315,33 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
   console.log(`  SEBELUM: aturan=${Array.from(beforeVersions).join(',') || '-'}  code_hash=${Array.from(beforeHashes).join(',') || '-'}`);
   console.log(`  SESUDAH: aturan=${RULES_VERSION}  code_hash=${currentHash}`);
   console.log(`  Run dibandingkan: ${compared}${missingRuns ? ` (tidak ada di simpanan: ${missingRuns})` : ''}`);
-  if (inputDiff > 0) {
-    console.log(`  !! INPUT BERBEDA pada ${inputDiff} run: perbandingan ini BUKAN apple-to-apple.`);
+  if (inputDiff > 0 || configDiff > 0) {
+    console.log(
+      `  !! INPUT/KONFIGURASI BERBEDA (raw: ${inputDiff} run, SRT/chunk: ${configDiff} run): ` +
+      `perbandingan ini BUKAN apple-to-apple.`
+    );
   } else if (inputUnknown > 0 && inputSame === 0) {
     console.log('  ?  raw_sha tidak tercatat di simpanan (dibuat replay-run versi lama): kesamaan input tidak terverifikasi.');
+  } else if (configUnknown > 0) {
+    console.log(
+      `  ?  fingerprint SRT/konfigurasi chunk tidak lengkap di simpanan pada ${configUnknown} run ` +
+      `(snapshot dibuat sebelum Patch 1/1c): kesamaan konteks rekonstruksi tidak terverifikasi. ` +
+      `Buat ulang simpanan dengan --json.`
+    );
   } else {
-    console.log(`  INPUT IDENTIK (raw_sha sama pada ${inputSame} run${inputUnknown ? `; ${inputUnknown} run tanpa raw_sha` : ''}): selisih berasal dari kode/aturan saja.`);
+    console.log(
+      `  INPUT IDENTIK (raw_sha sama pada ${inputSame} run${inputUnknown ? `; ${inputUnknown} run tanpa raw_sha` : ''}; ` +
+      `srt_sha + konfigurasi chunk sama; isi SRT sama dengan saat snapshot): ` +
+      `selisih berasal dari kode/aturan saja.`
+    );
+  }
+
+  if (srtFidelityWarn > 0) {
+    console.log(
+      `  ~  ${srtFidelityWarn} run: isi SRT berbeda dari run asli (fidelitas terhadap run asli ` +
+      `tidak terjamin untuk GROUNDING/PROVENANCE). Ini TIDAK mempengaruhi kesetaraan ` +
+      `snapshot vs sekarang.`
+    );
   }
 
   const sum = (t: Record<string, number>) => t.diterima + t['diterima+flag'] + t.karantina;
@@ -1177,16 +1378,29 @@ function printDiff(results: ReplayResult[], prevPath: string, full: boolean, cur
 function main(): void {
   const args: string[] = process.argv.slice(2);
   const flag = (name: string) => args.includes(name);
+
+  // Flag yang membawa nilai. Nilainya TIDAK boleh dianggap argumen posisi
+  // (bug lama: nilai --filter/--audit/--sample dikira nama run).
+  const VALUE_FLAGS = new Set(['--json', '--diff', '--filter', '--audit', '--sample']);
+
   const valueOf = (name: string): string | undefined => {
     const i = args.indexOf(name);
-    return i >= 0 ? args[i + 1] : undefined;
+    if (i < 0) return undefined;
+    const v = args[i + 1];
+    if (v === undefined || v.startsWith('--')) {
+      console.error(`${name} membutuhkan sebuah nilai.`);
+      process.exit(1);
+    }
+    return v;
   };
-  const skip = new Set<number>();
-  for (const f of ['--json', '--diff']) {
-    const i = args.indexOf(f);
-    if (i >= 0) { skip.add(i); skip.add(i + 1); }
+
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (VALUE_FLAGS.has(a)) { i++; continue; }  // lewati flag + nilainya
+    if (a.startsWith('--')) continue;
+    positional.push(a);
   }
-  const positional = args.filter((a, i) => !a.startsWith('--') && !skip.has(i));
 
   const filterKind = valueOf('--filter') as FailKind | undefined;
     const VALID: FailKind[] = [
@@ -1199,15 +1413,29 @@ function main(): void {
   }
   const sampleN = Number(valueOf('--sample') ?? '10');
 
-    const auditRule = valueOf('--audit');
+  // Fail-fast: validasi nilai flag SEBELUM replay panjang berjalan.
+  const jsonOut = valueOf('--json');
+  const diffIn = valueOf('--diff');
+  if (diffIn && !fs.existsSync(diffIn)) {
+    console.error(`File simpanan tidak ditemukan: ${diffIn}`);
+    process.exit(1);
+  }
+
+  const auditRule = valueOf('--audit');
+  if (auditRule && AUDIT_NOT_EVALUATED.includes(auditRule)) {
+    console.error(
+      `--audit ${auditRule} tidak didukung: replay tidak mengevaluasi aturan ini ` +
+      `(berjalan pasca-duplicate-gate di server.ts). Hasil "0 karantina" akan menyesatkan, ` +
+      `jadi diblokir.`
+    );
+    process.exit(1);
+  }
   const AUDIT_RULES_VALID = [
-    'ASSESSMENT', 'ATOMICITY', 'VALUE',
-    'GROUNDING', 'PROVENANCE', 'RELATION', 'TIMESTAMP'
+    'ASSESSMENT', 'ATOMICITY', 'VALUE', 'GROUNDING', 'PROVENANCE'
   ];
   if (auditRule && !AUDIT_RULES_VALID.includes(auditRule)) {
     console.error(
-      `--audit nilai tidak valid: ${auditRule}. ` +
-      `Pilih: ${AUDIT_RULES_VALID.join('|')} (atau rule lain yang muncul di output)`
+      `--audit nilai tidak valid: ${auditRule}. Pilih: ${AUDIT_RULES_VALID.join('|')}`
     );
     process.exit(1);
   }
@@ -1268,13 +1496,16 @@ function main(): void {
     );
   }
 
-  const jsonOut = valueOf('--json');
   if (jsonOut) {
     const toSaved = (r: ReplayResult): SavedRun => ({
       run_id: r.run.run_id,
       code_hash: currentHash,
       rules_version: RULES_VERSION,
       raw_sha: r.rawSha,
+      srt_sha: r.run.srt_sha,
+      srt_content_sha: r.srtContentSha ?? null,
+      chunk_chars: r.run.chunk_chars ?? null,
+      chunk_overlap: r.run.chunk_overlap ?? null,
       items: r.items
     });
     const payload = results.length === 1 ? toSaved(results[0]) : results.map(toSaved);
@@ -1282,12 +1513,7 @@ function main(): void {
     console.log(`\nKeputusan per item disimpan ke ${jsonOut} (aturan=${RULES_VERSION}, code_hash=${currentHash})`);
   }
 
-  const diffIn = valueOf('--diff');
   if (diffIn) {
-    if (!fs.existsSync(diffIn)) {
-      console.error(`File simpanan tidak ditemukan: ${diffIn}`);
-      process.exit(1);
-    }
     printDiff(results, diffIn, flag('--full'), currentHash);
   }
 }
