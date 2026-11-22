@@ -581,8 +581,13 @@ async function extractEvidence(
 
       // Nomor lokal LLM dihitung dari SEMUA item hasil parse, sebelum filter
       // struktural/validator, karena LLM menomori urutan keluarannya sendiri.
+      // Metadata ID (model vs auto-fill) diteruskan untuk diagnosis collision.
       const { keys: chunkKeys, diagnostics: chunkKeyDiag } =
-        buildChunkLocalKeys(chunkEvidence as any[], chunkIndex);
+        buildChunkLocalKeys(
+          chunkEvidence as any[],
+          chunkIndex,
+          parsedResult.idMetadata
+        );
       chunkKeyDiagnostics.push(chunkKeyDiag);
       console.log(
 
@@ -595,6 +600,14 @@ async function extractEvidence(
         console.warn(
           `⚠️ Chunk ${chunkIndex + 1}: nomor lokal memakai posisi (alasan: ${chunkKeyDiag.reason}, ` +
           `id hilang: ${chunkKeyDiag.missingIds}, id ganda: ${chunkKeyDiag.duplicateIds.join(',') || '-'})`
+        );
+      }
+            // Log berapa ID yang diisi parser (bukan dari model) — observability.
+      if (chunkKeyDiag.autoFilledCount > 0) {
+        console.warn(
+          `⚠️ Chunk ${chunkIndex + 1}: ${chunkKeyDiag.autoFilledCount}/` +
+          `${chunkKeyDiag.totalParsed} evidence tanpa evidence_id dari model ` +
+          `(di-auto-fill dengan posisi).`
         );
       }
       const keyByEv = new Map<unknown, LocalKey>();
