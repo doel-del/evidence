@@ -460,33 +460,94 @@ export function remapRelatedIds<T extends HasRelated>(
   return { evidence: out as T[], stats };
 }
 
+export interface RedirectDiagnostics {
+  /** ID yang punya >1 tujuan akhir berbeda (konflik pemetaan). Ref ke ID ini dibuang. */
+  ambiguousIds: string[];
+  /** ID yang berada dalam siklus redirect. Ref ke ID ini dibuang. */
+  cyclicIds: string[];
+}
+
+type RedirectResolution =
+  | { status: 'ok'; id: string }
+  | { status: 'ambiguous' }
+  | { status: 'cyclic' };
+
 /**
  * Langkah 4: setelah duplicate gate.
  * - id yang dihapus sebagai duplikat -> diarahkan ke kept_evidence_id
- * - id a/b yang digabung -> diarahkan ke merged_evidence_id
+ * - semua anggota merge (merged_from_ids, fallback [a, b]) -> merged_evidence_id
+ * - rantai redirect diikuti sampai id yang masih ada, tanpa batas hop
+ * - siklus dan konflik (satu id ke dua tujuan akhir berbeda) dibuang secara
+ *   deterministik, tidak bergantung urutan `removed`/`merged`
+ * - id yang masih ada di hasil akhir TIDAK pernah di-redirect (alive wins)
  * - referensi ke id yang tidak ada di hasil akhir, ke diri sendiri,
  *   atau ganda -> dibuang
  */
 export function redirectRelatedIds<T extends HasRelated>(
   preserved: T[],
   removed: Array<{ evidence_id: string; kept_evidence_id: string }>,
-  merged: Array<{ evidence_id_a: string; evidence_id_b: string; merged_evidence_id: string }>
-): { evidence: T[]; dropped: number } {
-  const redirect = new Map<string, string>();
-  for (const r of removed) redirect.set(r.evidence_id, r.kept_evidence_id);
-  for (const m of merged) {
-    redirect.set(m.evidence_id_a, m.merged_evidence_id);
-    redirect.set(m.evidence_id_b, m.merged_evidence_id);
-  }
-  const resolve = (id: string): string => {
-    let cur = id;
-    for (let hop = 0; hop < 5 && redirect.has(cur) && redirect.get(cur) !== cur; hop++) {
-      cur = redirect.get(cur)!;
+  merged: Array<{
+    evidence_id_a: string;
+    evidence_id_b: string;
+    merged_evidence_id: string;
+    merged_from_ids?: string[];
+  }>
+): { evidence: T[]; dropped: number; diagnostics: RedirectDiagnostics } {
+  // Graf redirect: id -> himpunan tujuan langsung.
+  const direct = new Map<string, Set<string>>();
+  const addEdge = (from: string | null | undefined, to: string | null | undefined) => {
+    if (!from || !to || from === to) return;
+    let set = direct.get(from);
+    if (!set) {
+      set = new Set();
+      direct.set(from, set);
     }
-    return cur;
+    set.add(to);
   };
 
+  for (const r of removed) addEdge(r.evidence_id, r.kept_evidence_id);
+  for (const m of merged) {
+    const members = new Set<string>([
+      m.evidence_id_a,
+      m.evidence_id_b,
+      ...(m.merged_from_ids ?? [])
+    ]);
+    for (const member of members) addEdge(member, m.merged_evidence_id);
+  }
+
   const finalIds = new Set(preserved.map(e => e.evidence_id).filter(Boolean) as string[]);
+
+  const memo = new Map<string, RedirectResolution>();
+  const resolve = (id: string, path: Set<string>): RedirectResolution => {
+    if (finalIds.has(id)) return { status: 'ok', id };
+    const cached = memo.get(id);
+    if (cached) return cached;
+
+    const targets = direct.get(id);
+    if (!targets) return { status: 'ok', id }; // ujung rantai; dicek terhadap finalIds oleh pemanggil
+    if (path.has(id)) return { status: 'cyclic' };
+
+    path.add(id);
+    const results = [...targets].map(t => resolve(t, path));
+    path.delete(id);
+
+    let out: RedirectResolution;
+    if (results.some(r => r.status === 'cyclic')) {
+      out = { status: 'cyclic' };
+    } else if (results.some(r => r.status === 'ambiguous')) {
+      out = { status: 'ambiguous' };
+    } else {
+      const ends = new Set(results.map(r => (r as { id: string }).id));
+      out = ends.size === 1
+        ? { status: 'ok', id: [...ends][0] }
+        : { status: 'ambiguous' };
+    }
+    memo.set(id, out);
+    return out;
+  };
+
+  const ambiguousIds = new Set<string>();
+  const cyclicIds = new Set<string>();
   let dropped = 0;
 
   const evidence = preserved.map(ev => {
@@ -495,7 +556,18 @@ export function redirectRelatedIds<T extends HasRelated>(
     const seen = new Set<string>();
     const result: string[] = [];
     for (const r of raw) {
-      const target = resolve(r);
+      const res = resolve(r, new Set());
+      if (res.status === 'ambiguous') {
+        ambiguousIds.add(r);
+        dropped++;
+        continue;
+      }
+      if (res.status === 'cyclic') {
+        cyclicIds.add(r);
+        dropped++;
+        continue;
+      }
+      const target = res.id;
       if (!finalIds.has(target) || target === ev.evidence_id || seen.has(target)) {
         dropped++;
         continue;
@@ -506,5 +578,12 @@ export function redirectRelatedIds<T extends HasRelated>(
     return { ...ev, related_evidence_ids: result.length ? result : null };
   });
 
-  return { evidence: evidence as T[], dropped };
+  return {
+    evidence: evidence as T[],
+    dropped,
+    diagnostics: {
+      ambiguousIds: [...ambiguousIds].sort(),
+      cyclicIds: [...cyclicIds].sort()
+    }
+  };
 }
