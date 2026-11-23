@@ -375,7 +375,7 @@ function diagnoseParseFailure(rawOutput: string): string[] {
 // ------------------------------------------------------------
 // Bandingkan chunk hasil rekonstruksi dengan record chunk run asli.
 // BOUNDARY_DIFF diprioritaskan di atas CHARS_DIFF.
-function verifyChunkContext(
+export function verifyChunkContext(
   orig: ChunkRecord | undefined,
   chunk: SRTSegment[]
 ): { status: ContextStatus; detail: string } {
@@ -396,10 +396,10 @@ function verifyChunkContext(
       detail: `segmen asli ${orig.segments[0]}..${orig.segments[1]} vs rekonstruksi ${first}..${last}`
     };
   }
-  
+
   if (orig.chars !== chars) {
-    // Format lama: tanpa penanda "[N] " per segmen. Hanya dinyatakan legacy
-    // bila selisihnya PERSIS sama dengan total panjang penanda.
+    // Format lama: tanpa penanda "[N] " per segmen. Legacy hanya bila selisih
+    // PERSIS sama dengan total panjang penanda.
     const markerChars = chunk.reduce((n, s) => n + String(s.index).length + 3, 0);
     if (orig.chars === chars - markerChars) {
       return {
@@ -413,12 +413,15 @@ function verifyChunkContext(
     };
   }
 
+  return { status: 'OK', detail: 'batas segmen dan jumlah karakter cocok' };
+}
+
 export function computeRunTrust(input: {
   srtVerified: boolean | undefined;
   hasChunkConfig: boolean;
   reconstructedChunkCount: number;
   recordedChunkCount: number;
-  chunkCtx: Array<{ chunk: number; ctx?: ContextStatus }>;
+  chunkCtx: Array<{ chunk: number; ctx?: ContextStatus; rawMissingUnexpected?: boolean }>;
 }): { trust: RunTrust; reasons: string[] } {
   const reasons: string[] = [];
   if (input.srtVerified !== true) reasons.push('isi SRT tidak terverifikasi terhadap srt_sha');
@@ -434,7 +437,9 @@ export function computeRunTrust(input: {
     if (c.ctx !== 'OK' && c.ctx !== 'LEGACY_FORMAT') {
       reasons.push(`chunk ${c.chunk}: ctx=${c.ctx ?? '-'}`);
     }
+    if (c.rawMissingUnexpected) reasons.push(`chunk ${c.chunk}: raw hilang`);
   }
+  return { trust: reasons.length ? 'UNVERIFIED' : 'VERIFIED', reasons };
 }
 
 function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResult {
@@ -488,8 +493,9 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
     const n = chunkIndex + 1;
     chunkSegmentsMap.set(n, chunk);
     const ctxCheck = verifyChunkContext(run.chunks.find(c => c.chunk === n), chunk);
-    const rawPath = path.join(RUN_LOG_DIR, run.run_id, `chunk-${n}.raw.txt`);
+        const rawPath = path.join(RUN_LOG_DIR, run.run_id, `chunk-${n}.raw.txt`);
     const origRec = run.chunks.find(c => c.chunk === n);
+    if (!fs.existsSync(rawPath)) {
       chunks.push({
         chunk: n, parsed: 0, structurallyInvalid: 0, accepted: 0, flagged: 0, quarantine: 0,
         parseStatus: '-', strategy: '-', note: 'raw tidak ada (chunk gagal di run asli?)',
@@ -605,7 +611,7 @@ function replayRun(run: RunRecord, withDuplicates: boolean = false): ReplayResul
     hasChunkConfig,
     reconstructedChunkCount: evChunks.length,
     recordedChunkCount: run.chunks.length,
-    chunkCtx: chunks.map(c => ({ chunk: c.chunk, ctx: c.ctx }))
+    chunkCtx: chunks.map(c => ({ chunk: c.chunk, ctx: c.ctx, rawMissingUnexpected: c.rawMissingUnexpected }))
   });
 
     return {
