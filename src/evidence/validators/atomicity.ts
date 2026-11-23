@@ -77,9 +77,28 @@ const ADJECTIVE_PAIR_RE = new RegExp(
   'i'
 );
 
+// Kondisi/protokol uji yang menyertai SATU hasil ukur. Hanya dibuang untuk
+// pemeriksaan multi-value, dan hanya pada klaim yang diawali metrik hasil uji.
+// Klaim lain ("kedalaman 1 meter selama 30 menit") tidak tersentuh.
+const MEASUREMENT_SUBJECT_RE =
+  /^\s*(?:baterai|suhu|temperatur|frame\s+rate|streaming|pemutaran|proses|daya\s+tahan|ketahanan)\b/;
+
+const TEST_CONDITION_PHRASES: RegExp[] = [
+  /\b(?:selama|durasi)\s+(?:\d+(?:[.,]\d+)?|setengah|satu)\s*(?:menit|jam|detik)\b/g,
+  /\b(?:pada|di)\s+mode\s+\d+\s*hz\b/g,
+  /\bpreset\s+(?:[a-z]+\s+){0,2}\d+\s*fps\b/g
+];
+
 export const AtomicityValidator = {
   validate(claim: string | undefined): ValidationResult {
-    const normalizedClaim = (claim || '').toLowerCase();
+  // Koma desimal Indonesia ("7,7 mm", "90,7%") bukan pemisah daftar.
+  // Dinormalisasi ke titik SEBELUM semua pemeriksaan koma (commaCount,
+  // commaList3PlusPattern). Hanya koma yang diapit digit; koma pemisah
+  // biasa (", ") tidak tersentuh. Semua regex angka di file ini sudah
+  // menerima [.,], jadi perilaku deteksi nilai tidak berubah.
+  const normalizedClaim = (claim || '')
+    .toLowerCase()
+    .replace(/(?<=\d),(?=\d)/g, '.');
 
     // ------------------------------------------------------------
     // 1. WHITELIST — klaim atomic yang sah memakai konjungsi
@@ -321,6 +340,7 @@ export const AtomicityValidator = {
     const claimForConjunction = claimForAtomicity
       .replace(fractionPairPattern, ' ')
       .replace(/\b[a-z]*\d+\s+plus\b/gi, ' [model_plus] ')   // "A11 Plus", "Note 20 Plus"
+      .replace(/\bram\s+plus\b/gi, ' [feature_ram_plus] ')    // fitur Samsung "RAM Plus"
       .replace(/\b\d+g\b/gi, ' [network_generation] ')        // "5G", "4G"
       .replace(/\blte\b/gi, ' [network_lte] ')                // "LTE"
       .replace(/\bwi-?fi(?:\s+only)?\b/gi, ' [wifi_variant] ') // "Wi-Fi Only"
@@ -378,7 +398,14 @@ export const AtomicityValidator = {
     const commaList3PlusPattern =
       /,[^,]{1,80},\s*(dan|serta|plus|kemudian)\b/i;
 
-    const hasMultiValue = multiValuePattern.test(claimNoRange);
+        const claimForMultiValue = MEASUREMENT_SUBJECT_RE.test(claimNoRange)
+      ? TEST_CONDITION_PHRASES.reduce(
+          (t, re) => t.replace(re, ' kondisi_uji '),
+          claimNoRange
+        )
+      : claimNoRange;
+
+    const hasMultiValue = multiValuePattern.test(claimForMultiValue);
     const hasCommaList3Plus = commaList3PlusPattern.test(claimNoRange);
 
     // ============================================================
