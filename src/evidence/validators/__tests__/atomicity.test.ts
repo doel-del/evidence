@@ -443,6 +443,19 @@ describe('ATOMICITY: variasi susunan konfigurasi RAM dan penyimpanan', () => {
   });
 });
 
+describe('ATOMICITY: "RAM Plus" adalah nama fitur, bukan konjungsi', () => {
+  test.each([
+    'Fitur RAM Plus dapat menambah virtual RAM hingga 8 GB',
+    'Fitur RAM Plus aktif secara default pada pengaturan 4 GB',
+    'Terdapat fitur RAM Plus untuk menambah virtual RAM hingga 8 GB'
+  ])('PASS bersih: %s', claim => {
+    expect(V(claim).status).toBe('PASS');
+  });
+
+  test('guard: "plus" sebagai konjungsi sungguhan tetap HIGH', () => {
+    expect(blocks('RAM 8 GB plus storage 256 GB')).toBe(true);
+  });
+});
 
 describe('ATOMICITY P1: konteks varian harus melekat pada konfigurasi', () => {
   test.each([
@@ -590,5 +603,49 @@ describe('ATOMICITY N04: nama chipset dan kontras chipset', () => {
   ])('fakta independen tetap HIGH: %s', claim => {
     const result = V(claim);
     expect(result.severity).toBe('HIGH');
+  });
+});
+
+describe('ATOMICITY: koma desimal bukan comma-list', () => {
+  test.each([
+    'Ketebalan bodi smartphone adalah 7,7 mm',
+    'Lebar smartphone sebesar 77,5 mm',
+    'Port audio jack 3,5 mm sudah tidak ada lagi',
+    'Mode Vivid memiliki gamut coverage 90,7% DCI-P3',
+    'Layar berukuran 6,7 inci dengan panel Super AMOLED'
+  ])('PASS bersih: %s', claim => {
+    const r = V(claim);
+    expect(r.status).toBe('PASS');
+    expect(r.severity).toBe('LOW');
+  });
+
+  test('guard: comma-list sungguhan tetap terdeteksi', () => {
+    expect(V('RAM 8 GB, storage 256 GB, dan baterai 5000 mAh').severity).toBe('HIGH');
+    expect(blocks('Layar 6,7 inci dan baterai 5000 mAh')).toBe(true);
+  });
+
+  test('guard: koma pemisah dengan spasi tidak dianggap desimal', () => {
+    expect(V('Fitur A, fitur B, dan fitur C').severity).toBe('MEDIUM');
+  });
+});
+
+describe('ATOMICITY: satu hasil ukur + kondisi uji', () => {
+  test.each([
+    'Baterai berkurang 4% untuk pemutaran video YouTube 1080p 30 fps non-HDR selama setengah jam pada mode 120 Hz',
+    'Baterai berkurang 4% untuk pemutaran video YouTube 1080p 30 fps non-HDR selama setengah jam pada mode 60 Hz',
+    'Suhu panas maksimal mencapai 44 derajat Celsius setelah bermain MLBB selama 30 menit',
+    'Temperatur perangkat mencapai 41 derajat Celsius saat bermain game MLBB selama 30 menit',
+    'Baterai berkurang sekitar 13% saat memainkan Genshin Impact selama 30 menit pada preset Highest 60 fps',
+    'Frame rate Genshin Impact sesekali dapat mencapai di atas 45 fps pada preset Highest 60 fps'
+  ])('tidak HIGH: %s', claim => {
+    expect(blocks(claim)).toBe(false);
+  });
+
+  test.each([
+    'Streaming YouTube 1080p 30 fps non-HDR selama setengah jam mengurangi baterai sebanyak 4% pada mode 120 Hz maupun 60 Hz',
+    'Tahan air pada kedalaman 1 meter selama 30 menit',
+    'Baterai turun 7 persen pada mode 120 Hz selama 30 menit dan suhu mencapai 41 derajat Celsius'
+  ])('guard, tetap HIGH: %s', claim => {
+    expect(blocks(claim)).toBe(true);
   });
 });
