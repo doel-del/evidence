@@ -84,6 +84,7 @@ import type { SRTSegment } from '../src/evidence/srt';
 import { collectAmbiguous, printAmbiguousReport } from './ambiguous-report';
 import type { DuplicateResult } from '../src/evidence/validators/duplicate';
 import type { EvidenceContext, EvidenceItem } from '../src/evidence/types';
+import { MAX_VALIDATION_SPAN } from '../src/evidence/search';
 
 const RULES_VERSION: string =
   (assessmentModule as unknown as { ASSESSMENT_RULES_VERSION?: string }).ASSESSMENT_RULES_VERSION ?? 'legacy';
@@ -212,7 +213,7 @@ interface SavedRun {
 
 // Sinkron dengan maxSpan di provenance.ts / grounding.ts (Opsi A). Hanya
 // untuk teks diagnostik; bukan sumber kebenaran.
-const PROVENANCE_MAX_SPAN = 5;
+const PROVENANCE_MAX_SPAN = MAX_VALIDATION_SPAN;
 
 // Aturan --audit yang TIDAK dievaluasi replay: replayRun hanya menjalankan
 // EvidenceValidator.validate (5 aturan per-evidence). TimestampValidator dan
