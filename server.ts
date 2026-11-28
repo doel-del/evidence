@@ -51,7 +51,8 @@ import type { SRTSegment } from './src/evidence/srt';
 import {
   buildChunkLocalKeys,
   remapRelatedIds,
-  redirectRelatedIds
+  redirectRelatedIds,
+  pruneDanglingRelatedIds
 } from './src/evidence/related-ids';
 import type { LocalKey, ChunkKeyDiagnostics } from './src/evidence/related-ids';
 import { normalizeForSearch } from './src/evidence/srt';
@@ -640,7 +641,8 @@ async function extractEvidence(
         const context: EvidenceContext = {
           chunkIndex,
           chunkText,
-          chunkSegments: chunk
+          chunkSegments: chunk,
+          allSegments: segments
         };
 
         // ▼ Normalisasi string kosong/"null" -> null (sebelum reconcile & validasi)
@@ -899,6 +901,23 @@ async function extractEvidence(
       `dipindahkan ke quarantine (source_coordinates ada tapi timestamp ` +
       `tidak konsisten dengan SRT).`
     );
+  }
+
+    // ── Bersihkan referensi menggantung setelah timestamp gate ──
+  // Evidence yang masuk quarantine karena timestamp sudah keluar dari
+  // finalEvidence, tetapi evidence lain mungkin masih merujuknya.
+  // Hanya referensi yang dibuang; evidence perujuk TIDAK dikarantina.
+  // splice dipakai agar variabel finalEvidence yang dipakai hilir
+  // (autoFill, RelationValidator) tidak perlu diganti.
+  {
+    const pruned = pruneDanglingRelatedIds(finalEvidence);
+    if (pruned.dropped > 0) {
+      console.log(
+        `🔗 ${pruned.dropped} referensi related_evidence_ids ke evidence yang ` +
+        `tidak ada di hasil akhir dibuang (timestamp gate).`
+      );
+      finalEvidence.splice(0, finalEvidence.length, ...pruned.evidence);
+    }
   }
 
   // ── Relation auto-fill (post-process, lintas-chunk) ────────
@@ -1328,7 +1347,8 @@ export function resolveDuplicateActions(
             s =>
               s.index >= mergedCoords.segment_start_index &&
               s.index <= mergedCoords.segment_end_index
-          )
+          ),
+          allSegments: segments
         };
 
         const mergedReport = EvidenceValidator.validate(
